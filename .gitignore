@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Outputs temporários
+*.log
+/tmp_audio/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
