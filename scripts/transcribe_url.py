@@ -67,8 +67,13 @@ def require_env(name: str) -> str:
 def firecrawl_get_audio_url(url: str, api_key: str) -> str:
     """Chama o Firecrawl scrape solicitando o formato 'audio'. Retorna URL do MP3.
 
-    A API do Firecrawl varia entre versões — tentamos os dois shapes de
-    resposta conhecidos (dict aninhado em `data` e atributo direto).
+    Compat de SDK: firecrawl-py v1 expunha `scrape_url(...)`; v2+ renomeou
+    pra `scrape(...)`. Pegamos qualquer um dos dois via `getattr`.
+    Tentamos também ambos os shapes de chamada (kwargs `formats=` direto e
+    o legado `params={"formats": ...}`).
+
+    O shape da resposta também variou entre versões — `_extract_audio_url`
+    tolera dict aninhado em `data`, atributo direto, e Document-like.
     """
     try:
         from firecrawl import FirecrawlApp
@@ -79,11 +84,22 @@ def firecrawl_get_audio_url(url: str, api_key: str) -> str:
         )
     log("scrape via Firecrawl (formats=audio)…")
     app = FirecrawlApp(api_key=api_key)
+
+    scrape_fn = getattr(app, "scrape", None) or getattr(app, "scrape_url", None)
+    if scrape_fn is None:
+        die(
+            "firecrawl-py: nenhum método scrape/scrape_url no SDK instalado "
+            f"(versão incompatível). dir(app)={[a for a in dir(app) if not a.startswith('_')][:20]}"
+        )
+
     try:
-        result = app.scrape_url(url, formats=["audio"])
+        result = scrape_fn(url, formats=["audio"])
     except TypeError:
-        # SDK mais antigo usava 'params={"formats": ...}'
-        result = app.scrape_url(url, params={"formats": ["audio"]})
+        # SDK antigo usava `params={...}` em vez de kwargs diretos.
+        try:
+            result = scrape_fn(url, params={"formats": ["audio"]})
+        except Exception as exc:  # noqa: BLE001
+            die(f"Firecrawl falhou (params fallback): {exc}")
     except Exception as exc:  # noqa: BLE001
         die(f"Firecrawl falhou: {exc}")
 
