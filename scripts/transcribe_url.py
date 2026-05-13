@@ -50,11 +50,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -666,6 +669,38 @@ def _slug_from_url(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
 
+def _is_youtube(url: str) -> bool:
+    return bool(re.search(r"(?:youtube\.com|youtu\.be)", url, re.I))
+
+
+def youtube_oembed_title(url: str) -> str | None:
+    """Pega o título canônico do vídeo via oEmbed do YouTube.
+
+    Razão: o Firecrawl extrai `<title>` da HTML servida, que o YouTube
+    pode traduzir baseado em Accept-Language/geo-IP do servidor que
+    fez o scrape — então um vídeo em PT-BR pode chegar com título em
+    inglês. O endpoint `/oembed` sempre devolve o título publicado pelo
+    canal, sem tradução automática.
+
+    Retorna None silenciosamente em qualquer erro (rede, 404, JSON
+    inválido) — o caller deve cair pro `metadata.title` do Firecrawl.
+    """
+    if not _is_youtube(url):
+        return None
+    endpoint = "https://www.youtube.com/oembed?" + urllib.parse.urlencode(
+        {"url": url, "format": "json"}
+    )
+    try:
+        with urllib.request.urlopen(endpoint, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return None
+    title = data.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return None
+
+
 def _default_output_dir() -> Path:
     """Onde gravar a transcrição final.
 
@@ -714,7 +749,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     audio_url, scraped_title = firecrawl_scrape(args.url, fc_key)
-    title = args.title or scraped_title or _slug_from_url(args.url)
+    # Prioridade do título: --title (override) > oEmbed YouTube (canônico)
+    # > metadata.title do Firecrawl (pode vir traduzido) > slug do video ID.
+    oembed_title = youtube_oembed_title(args.url) if not args.title else None
+    title = args.title or oembed_title or scraped_title or _slug_from_url(args.url)
+    if oembed_title:
+        log(f"título via YouTube oEmbed: {oembed_title!r}")
 
     workdir = Path(tempfile.mkdtemp(prefix="atrus-"))
     mp3 = workdir / "input.mp3"

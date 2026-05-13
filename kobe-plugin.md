@@ -1,7 +1,7 @@
 ---
 name: atrus
 visibility: public
-version: 0.3.0
+version: 0.3.1
 description: "Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper, com diarização opcional de speakers via pyannote local. Quatro formatos — TXT analysis e HTML reading, cada um com ou sem speakers. TXT tem timestamp por frase (estilo TurboScribe); HTML tem 1 timestamp por parágrafo (leitura limpa). Saída em `user-data/artifacts/transcricoes/`. Aceita múltiplas URLs em série, progresso via kobe-notify/kobe-attach. IMPORTANTE — delegue direto sem perguntar formato; o subagente é quem pergunta `[1] TXT / [2] HTML / [3] TXT+speakers / [4] HTML+speakers` quando o formato não veio explícito no slash."
 triggers:
   - "operador manda link de YouTube, Vimeo, Spotify, podcast ou pede 'transcreve esse vídeo/link'"
