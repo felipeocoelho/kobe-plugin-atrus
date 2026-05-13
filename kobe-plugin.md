@@ -1,8 +1,8 @@
 ---
 name: atrus
 visibility: public
-version: 0.2.0
-description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Dois formatos de saída — análise (TXT com timestamps por segmento) e leitura (HTML estilo livro). Aceita múltiplas URLs em série, com progresso em tempo real via kobe-notify/kobe-attach.
+version: 0.2.1
+description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Dois formatos de saída — análise (TXT) e leitura (HTML estilo livro), ambos no estilo TurboScribe (parágrafos de ~3 frases, timestamp `(M:SS)` prefixando cada frase). Aceita múltiplas URLs em série, com progresso em tempo real via kobe-notify/kobe-attach.
 triggers:
   - "operador manda link de YouTube, Vimeo, Spotify, podcast ou pede 'transcreve esse vídeo/link'"
   - "comando textual `/transcrever <url1> <url2> ...` (formato análise, com timestamps)"
@@ -28,8 +28,10 @@ Plugin público do Kobe pra transcrição de URLs de mídia. Resolve o problema 
 
 | Slash | Formato | Saída | Caso de uso |
 |---|---|---|---|
-| `/transcrever <urls>` | **analysis** | `.txt` com `[HH:MM:SS] texto` por segmento | Texto bruto pra ser analisado por skill/prompt — timestamps preservam "quando foi dito o quê" |
-| `/transcrever-leitura <urls>` | **reading** | `.html` standalone (CSS embarcado: serif, fundo creme, line-height 1.75, parágrafos curtos) | Consumo humano direto no celular/navegador |
+| `/transcrever <urls>` | **analysis** | `.txt` estilo TurboScribe: parágrafos de ~3 frases, cada frase prefixada por `(M:SS)` | Texto bruto pra ser analisado por skill/prompt — frases completas e bem pontuadas, timestamp por frase |
+| `/transcrever-leitura <urls>` | **reading** | `.html` standalone com mesmo conteúdo do analysis, dentro de `<p>` estilizados (timestamp em `<span class="ts">` discreto) | Consumo humano direto no celular/navegador |
+
+Ambos os formatos derivam dos `segments[]` do Whisper-large-v3 (`verbose_json`), agrupados em frases por pontuação (`.!?`) e em parágrafos de 3 frases. Não tem speaker diarization ainda — todas as falas saem como um único bloco, mesmo em vídeos com múltiplos speakers.
 
 Se a URL chegar sem slash, o subagente pergunta o formato em texto: "[1] TXT timestamps / [2] HTML leitura" e processa após a resposta.
 

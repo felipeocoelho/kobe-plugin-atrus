@@ -117,6 +117,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     text-align: justify;
     hyphens: auto;
   }}
+  .ts {{
+    color: var(--meta);
+    font-size: 0.78em;
+    font-family: "SF Mono", Consolas, Menlo, monospace;
+    margin-right: 0.2em;
+  }}
   @media (max-width: 480px) {{
     body {{ font-size: 17px; padding: 1.2em 1em 3em; }}
     p {{ text-align: left; }}
@@ -132,6 +138,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+# Quantas frases por parágrafo no rendering final. TurboScribe usa ~3-4;
+# 3 fica visualmente confortável tanto no TXT quanto no HTML.
+SENTENCES_PER_PARAGRAPH = 3
 
 
 def log(msg: str) -> None:
@@ -331,61 +341,96 @@ def transcribe_all(mp3: Path, groq_key: str) -> list[dict]:
 
 # ───────────────────────── renderers ─────────────────────────────────
 
+# Pontuação que fecha sentença. Aspas/parênteses depois disso ainda
+# fecham — usamos `rstrip` antes pra normalizar.
+_SENTENCE_END = (".", "!", "?")
+_CLOSERS = ' "”’\')]'
+
+
 def _format_timestamp(seconds: float) -> str:
+    """Formato curto estilo TurboScribe: `(M:SS)` se < 1h, `(H:MM:SS)` caso contrário.
+
+    Sem zero-padding nos minutos quando < 1h — assim `(0:03)`, `(2:30)`.
+    """
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _segments_to_sentences(segments: list[dict]) -> list[tuple[float, str]]:
+    """Acumula `segments[].text` até fechar uma sentença (`.!?` no fim).
+
+    Whisper fragmenta em 2-5s por pausa curta (vírgula), mas cada segment
+    já carrega a pontuação correta. Concatenamos com espaço até ver
+    `.!?` (ignorando aspas/parênteses fechantes) e selamos uma frase. O
+    timestamp da frase é o `start` do primeiro segment dela.
+
+    Se a transcrição inteira terminar sem fechar (raro), a sobra vira a
+    última "sentença".
+    """
+    sentences: list[tuple[float, str]] = []
+    buf: list[str] = []
+    start: float | None = None
+    for seg in segments:
+        text = seg["text"].strip()
+        if not text:
+            continue
+        if start is None:
+            start = seg["start"]
+        buf.append(text)
+        if text.rstrip(_CLOSERS).endswith(_SENTENCE_END):
+            sentences.append((start, " ".join(buf)))
+            buf = []
+            start = None
+    if buf:
+        sentences.append((start or 0.0, " ".join(buf)))
+    return sentences
+
+
+def _group_into_paragraphs(
+    sentences: list[tuple[float, str]], per_paragraph: int = SENTENCES_PER_PARAGRAPH
+) -> list[list[tuple[float, str]]]:
+    """Agrupa N sentenças por parágrafo, formato TurboScribe."""
+    return [
+        sentences[i : i + per_paragraph]
+        for i in range(0, len(sentences), per_paragraph)
+    ]
 
 
 def render_analysis(segments: list[dict]) -> str:
-    """Texto cru com timestamps absolutos, um segmento por linha."""
-    lines: list[str] = []
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        lines.append(f"[{_format_timestamp(seg['start'])}] {text}")
-    return "\n".join(lines) + "\n"
-
-
-def _group_paragraphs(
-    segments: list[dict], max_segs: int = 4, max_gap: float = 2.0
-) -> list[str]:
-    """Agrupa segments em parágrafos.
-
-    Quebra parágrafo quando:
-    - atingiu `max_segs` segments seguidos, OU
-    - gap entre fim do segment anterior e início do atual > `max_gap`s
-      (heurística de pausa, marca uma nova ideia).
-    """
-    paragraphs: list[str] = []
-    current: list[str] = []
-    last_end: float | None = None
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        gap_too_big = last_end is not None and (seg["start"] - last_end) > max_gap
-        if current and (len(current) >= max_segs or gap_too_big):
-            paragraphs.append(" ".join(current))
-            current = []
-        current.append(text)
-        last_end = seg["end"]
-    if current:
-        paragraphs.append(" ".join(current))
-    return paragraphs
+    """TXT estilo TurboScribe: parágrafos com `(M:SS) frase. (M:SS) frase.`."""
+    sentences = _segments_to_sentences(segments)
+    paragraphs = _group_into_paragraphs(sentences)
+    blocks: list[str] = []
+    for para in paragraphs:
+        parts = [f"({_format_timestamp(ts)}) {text}" for ts, text in para]
+        blocks.append(" ".join(parts))
+    return "\n\n".join(blocks) + "\n"
 
 
 def render_reading(segments: list[dict], title: str, url: str) -> str:
-    """HTML standalone com CSS embarcado."""
-    paragraphs = _group_paragraphs(segments)
-    body = "\n".join(f"    <p>{html.escape(p)}</p>" for p in paragraphs)
+    """HTML standalone — mesmo conteúdo do analysis, dentro de `<p>` estilizados.
+
+    Cada timestamp vai num `<span class="ts">` pra ficar visualmente
+    discreto (cor cinza, monospace pequeno).
+    """
+    sentences = _segments_to_sentences(segments)
+    paragraphs = _group_into_paragraphs(sentences)
+    body_parts: list[str] = []
+    for para in paragraphs:
+        chunks = [
+            f'<span class="ts">({_format_timestamp(ts)})</span> {html.escape(text)}'
+            for ts, text in para
+        ]
+        body_parts.append(f"    <p>{' '.join(chunks)}</p>")
     return HTML_TEMPLATE.format(
         title=html.escape(title or "Transcrição"),
         url=html.escape(url),
         date=datetime.now().strftime("%d/%m/%Y"),
-        body=body,
+        body="\n".join(body_parts),
     )
 
 

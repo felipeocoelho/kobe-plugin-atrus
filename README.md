@@ -51,8 +51,10 @@ A partir daí, qualquer URL de vídeo/podcast que você mandar no Telegram com i
 
 | Comando textual | Formato | Saída | Uso |
 |---|---|---|---|
-| `/transcrever <urls>` | `analysis` | `.txt` com `[HH:MM:SS] texto` | Pra alimentar análise downstream |
-| `/transcrever-leitura <urls>` | `reading` | `.html` standalone com CSS estilo livro | Pra ler no celular/navegador |
+| `/transcrever <urls>` | `analysis` | `.txt` estilo TurboScribe: parágrafos de ~3 frases, cada frase prefixada por `(M:SS)` | Pra alimentar análise downstream |
+| `/transcrever-leitura <urls>` | `reading` | `.html` standalone com mesmo conteúdo, dentro de `<p>` estilizados | Pra ler no celular/navegador |
+
+> **Speaker diarization (Speaker 1, Speaker 2 …) ainda não:** o Groq Whisper-large-v3 não detecta speakers nativamente. Vídeos com múltiplos depoentes saem como um único bloco. Diarization fica no roadmap (escolha entre Deepgram, AssemblyAI ou pyannote local).
 
 URL solta sem slash → o subagente pergunta o formato antes de processar (`[1]` / `[2]`).
 
