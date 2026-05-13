@@ -1,13 +1,13 @@
 ---
 name: atrus
 visibility: public
-version: 0.2.1
-description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Dois formatos de saída — análise (TXT) e leitura (HTML estilo livro), ambos no estilo TurboScribe (parágrafos de ~3 frases, timestamp `(M:SS)` prefixando cada frase). Aceita múltiplas URLs em série, com progresso em tempo real via kobe-notify/kobe-attach.
+version: 0.2.2
+description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Dois formatos de saída — análise (TXT) e leitura (HTML estilo livro), ambos estilo TurboScribe (parágrafos de ~3 frases, timestamp `(M:SS)` por frase). Aceita múltiplas URLs em série, progresso em tempo real via kobe-notify/kobe-attach. IMPORTANTE: delegue direto sem perguntar formato — o subagente é quem pergunta `[1] TXT / [2] HTML` quando o formato não veio explícito no slash command.
 triggers:
   - "operador manda link de YouTube, Vimeo, Spotify, podcast ou pede 'transcreve esse vídeo/link'"
   - "comando textual `/transcrever <url1> <url2> ...` (formato análise, com timestamps)"
   - "comando textual `/transcrever-leitura <url1> <url2> ...` (formato leitura, HTML)"
-  - "URL solta sem slash → subagente pergunta o formato antes de processar"
+  - "URL solta sem slash → DELEGA pro subagente direto; é ELE quem pergunta `[1] TXT / [2] HTML` na primeira mensagem. Agente principal NÃO pergunta o formato — só repassa."
 agent_definition: claude/agents/atrus.md
 dependencies:
   python:
