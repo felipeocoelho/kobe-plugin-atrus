@@ -1,11 +1,13 @@
 ---
 name: atrus
 visibility: public
-version: 0.1.0
-description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Resolve o caso clássico de IPs de datacenter bloqueados pelo YouTube — Firecrawl atua como proxy residencial pago via API e devolve URL assinada do MP3.
+version: 0.2.0
+description: Transcrição de URLs de mídia (YouTube, podcast, vídeo embed) via Firecrawl + Groq Whisper. Dois formatos de saída — análise (TXT com timestamps por segmento) e leitura (HTML estilo livro). Aceita múltiplas URLs em série, com progresso em tempo real via kobe-notify/kobe-attach.
 triggers:
   - "operador manda link de YouTube, Vimeo, Spotify, podcast ou pede 'transcreve esse vídeo/link'"
-  - "mensagem com URL de mídia + intenção explícita de transcrição"
+  - "comando textual `/transcrever <url1> <url2> ...` (formato análise, com timestamps)"
+  - "comando textual `/transcrever-leitura <url1> <url2> ...` (formato leitura, HTML)"
+  - "URL solta sem slash → subagente pergunta o formato antes de processar"
 agent_definition: claude/agents/atrus.md
 dependencies:
   python:
@@ -20,30 +22,48 @@ env:
 
 # Atrus — transcritor de URLs
 
-Plugin público do Kobe pra transcrição de URLs de mídia. Resolve o problema clássico de VPS sendo bloqueado por YouTube/Vimeo: o Firecrawl atua como proxy residencial (pago via API), retorna URL assinada do MP3, e o Groq Whisper (large-v3, language="pt", temperature=0) transcreve.
+Plugin público do Kobe pra transcrição de URLs de mídia. Resolve o problema clássico de VPS bloqueado pelo YouTube/Vimeo: **Firecrawl** atua como proxy residencial (pago via API) e devolve URL assinada do MP3; **Groq Whisper-large-v3** (PT-BR, temperature=0) transcreve com qualidade.
+
+## Dois formatos de saída
+
+| Slash | Formato | Saída | Caso de uso |
+|---|---|---|---|
+| `/transcrever <urls>` | **analysis** | `.txt` com `[HH:MM:SS] texto` por segmento | Texto bruto pra ser analisado por skill/prompt — timestamps preservam "quando foi dito o quê" |
+| `/transcrever-leitura <urls>` | **reading** | `.html` standalone (CSS embarcado: serif, fundo creme, line-height 1.75, parágrafos curtos) | Consumo humano direto no celular/navegador |
+
+Se a URL chegar sem slash, o subagente pergunta o formato em texto: "[1] TXT timestamps / [2] HTML leitura" e processa após a resposta.
+
+## Múltiplas URLs
+
+`/transcrever url1 url2 url3` processa **em série** (uma por vez), enviando notificação de progresso e anexo de cada uma assim que fica pronta — operador não fica em silêncio esperando 15min pelo último arquivo.
 
 ## Como funciona
 
 ```
-Telegram → Kobe → detecta URL de mídia
-              → subagente atrus
-              → scripts/transcribe_url.py <url>
-                  → Firecrawl scrape(formats=["audio"]) → URL MP3 (signed, 1h)
-                  → download do MP3
-                  → ffmpeg comprime mono 16kbps se > 25MB
-                  → chunking de 10min se ainda passar
-                  → Groq Whisper-large-v3 (pt, temp=0)
-              → texto na resposta do subagente
-              → Kobe devolve no Telegram (fatiando se > 4000 chars)
+Operador → Telegram → Kobe (agente principal)
+                    → reconhece slash / URL / intenção
+                    → invoca Agent(subagent_type="atrus", ...)
+                       → pra cada URL:
+                         kobe-notify "[N/M] Transcrevendo..."
+                         python transcribe_url.py <url> --format <X>
+                           → Firecrawl scrape(formats=["audio"]) → MP3 (signed 1h)
+                           → download HTTP direto
+                           → ffmpeg mono 16kbps se >25MB
+                           → chunking 10min se ainda passar
+                           → Whisper-large-v3 verbose_json
+                           → render analysis|reading → salva arquivo
+                           → stdout = path
+                         kobe-attach "$path"
+                       → resumo final
 ```
 
 ## Custos típicos
 
 - Firecrawl: ~$0.01–0.05 por scrape de áudio
 - Groq Whisper-large-v3: ~$0.11 por hora de áudio
-- Total: < $0.20 por hora transcrita
+- **Total: < $0.20 por hora transcrita**
 
-## Instalação
+## Instalação no Kobe
 
 ```bash
 bash $KOBE_HOME/infra/install-plugin.sh https://github.com/felipeocoelho/kobe-plugin-atrus.git
@@ -54,11 +74,16 @@ systemctl --user restart kobe
 
 ## Variáveis de ambiente
 
-- `FIRECRAWL_API_KEY` — chave da API Firecrawl (https://www.firecrawl.dev)
+- `FIRECRAWL_API_KEY` — https://www.firecrawl.dev
 - `GROQ_API_KEY` — já existe no Kobe-base, reusada pelo plugin
 
-## Limites e ressalvas
+## Requisitos do Kobe-base
 
-- Vídeos privados / removidos / region-locked: Firecrawl falha; mensagem clara, sem retry.
-- Áudio muito grande pós-compressão: chunking automático em pedaços de 10min (perde precisão de timestamps absolutos mas mantém qualidade da transcrição).
-- Não tenta detectar idioma — força `language="pt"` (operador é PT-BR). Adapte se for o caso.
+- **v0.7.0+** pro plugin discovery automático.
+- **v0.8.0+** pros helpers `kobe-notify` e `kobe-attach` (progresso em tempo real).
+
+## Limites conhecidos
+
+- Vídeos privados / removidos / region-locked falham no Firecrawl.
+- Chunking de 10min mantém timestamps coerentes (offset somado) mas se uma palavra cair na fronteira ela pode aparecer em ambos os pedaços.
+- `language="pt"` hardcoded — pra outros idiomas, edite no script.

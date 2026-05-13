@@ -47,6 +47,17 @@ A partir daí, qualquer URL de vídeo/podcast que você mandar no Telegram com i
 | `FIRECRAWL_API_KEY` | https://www.firecrawl.dev |
 | `GROQ_API_KEY` | https://console.groq.com (já configurada no Kobe-base) |
 
+## Dois formatos de saída
+
+| Comando textual | Formato | Saída | Uso |
+|---|---|---|---|
+| `/transcrever <urls>` | `analysis` | `.txt` com `[HH:MM:SS] texto` | Pra alimentar análise downstream |
+| `/transcrever-leitura <urls>` | `reading` | `.html` standalone com CSS estilo livro | Pra ler no celular/navegador |
+
+URL solta sem slash → o subagente pergunta o formato antes de processar (`[1]` / `[2]`).
+
+Múltiplas URLs num só comando: processadas em série, com progresso em tempo real via `kobe-notify` / `kobe-attach` — cada anexo chega conforme fica pronto.
+
 ## Uso direto (sem Kobe)
 
 O script é standalone — funciona via CLI:
@@ -54,10 +65,12 @@ O script é standalone — funciona via CLI:
 ```bash
 export FIRECRAWL_API_KEY=fc-...
 export GROQ_API_KEY=gsk-...
-python scripts/transcribe_url.py "https://www.youtube.com/watch?v=..."
+python scripts/transcribe_url.py "https://www.youtube.com/watch?v=..." \
+       --format analysis \
+       --output-dir /tmp
 ```
 
-Imprime a transcrição em stdout, progresso em stderr.
+Imprime o **path do arquivo gerado** em stdout, progresso em stderr.
 
 ## Limites conhecidos
 
