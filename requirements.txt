@@ -1,1 +1,4 @@
 firecrawl-py>=2.0
+assemblyai>=0.30
+gdown>=5.0
+

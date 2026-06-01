@@ -61,15 +61,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 GROQ_MAX_BYTES = 25 * 1024 * 1024
 WHISPER_MODEL = "whisper-large-v3"
 CHUNK_SECONDS = 600  # 10 min — limite prático pra chunking + Whisper
-
-# Pyannote speaker-diarization pipeline. Carregado lazy só quando --diarize.
-PYANNOTE_PIPELINE = "pyannote/speaker-diarization-3.1"
 
 # Fallback pra Whisper não pontuar: se o buffer da sentence atual passar
 # disso sem ver `.!?`, fechamos manualmente (adicionando `.`) pra evitar
@@ -292,6 +289,148 @@ def download(url: str, dest: Path) -> None:
     urllib.request.urlretrieve(url, str(dest))
 
 
+# ──────────────── source dispatcher (Drive / link direto / Firecrawl) ────
+
+# Extensões que indicam link direto pra arquivo de áudio/vídeo. Quando a
+# URL termina em uma destas, pulamos Firecrawl e baixamos via urllib.
+_DIRECT_AV_SUFFIXES = (
+    ".mp3", ".m4a", ".wav", ".ogg", ".flac",
+    ".mp4", ".webm", ".mov", ".mkv",
+)
+
+
+def _is_google_drive(url: str) -> bool:
+    return bool(re.search(r"drive\.google\.com/file/d/[\w-]+", url))
+
+
+def _is_direct_av_link(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    return any(path.endswith(ext) for ext in _DIRECT_AV_SUFFIXES)
+
+
+def acquire_audio(
+    url: str, fc_key: Optional[str], workdir: Path
+) -> tuple[Path, Optional[str]]:
+    """Resolve URL → arquivo local (mp3/mp4/etc). Retorna (path, title_or_none).
+
+    Roteia conforme o tipo da URL:
+    - Google Drive (`drive.google.com/file/d/<ID>/...`) → gdown direto.
+      Título vem do nome do arquivo no Drive (sem extensão).
+    - Link direto (`.../arquivo.mp3` ou `.mp4` etc.) → urllib download.
+      Título vem do nome do arquivo na URL (sem extensão).
+    - Outras URLs (YouTube/Vimeo/podcast/etc.) → Firecrawl scrape + download.
+      Título vem do `metadata.title` do Firecrawl.
+
+    `fc_key` só é usado no caminho Firecrawl. Caller pode passar None se
+    soubermos que vai por outro caminho.
+    """
+    if _is_google_drive(url):
+        return _acquire_drive(url, workdir)
+    if _is_direct_av_link(url):
+        return _acquire_direct(url, workdir)
+    if not fc_key:
+        die(
+            "URL não é Google Drive nem link direto, mas FIRECRAWL_API_KEY "
+            "não está configurada — sem caminho pra obter o áudio."
+        )
+    audio_url, scraped_title = firecrawl_scrape(url, fc_key)  # type: ignore[arg-type]
+    dest = workdir / "input.mp3"
+    download(audio_url, dest)
+    return dest, scraped_title
+
+
+def _filename_to_title(filename: str) -> Optional[str]:
+    """Converte um filename em título humano-legível.
+
+    Estratégia: tira extensão, troca _ e - por espaço, capitaliza primeira
+    letra. "minha_reuniao_com_cliente_X.mp4" → "Minha reuniao com cliente X".
+
+    Filtra só:
+    - filename vazio.
+    - hash hexadecimal puro (`[a-f0-9]{16,}`) — raro, mas não vira título.
+    Nomes timestamped tipo Zoom recording (`GMT20260427-...Recording_1920x1080`)
+    passam normalmente — não são hash hex puro.
+    """
+    stem = Path(filename).stem.strip()
+    if not stem:
+        return None
+    if re.fullmatch(r"[a-f0-9]{16,}", stem.lower()):
+        return None  # hash hex puro, não é título útil
+    cleaned = stem.replace("_", " ").replace("-", " ").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return None
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _acquire_drive(url: str, workdir: Path) -> tuple[Path, Optional[str]]:
+    """Baixa arquivo do Google Drive via gdown. Retorna (path, title).
+
+    Título vem do nome do arquivo no Drive (gdown preserva). Passamos
+    `output=<workdir>/` (com `/` final) pra que o gdown grave usando
+    o filename remoto em vez de renomear pra um nome fixo.
+
+    `gdown` lida com a página de confirmação que o Drive força em arquivos
+    grandes (>100MB) — pra arquivos pequenos vira HTTP direto.
+
+    Em gdown 6+, `fuzzy` foi removido. Extraímos o `file_id` do regex
+    manualmente e passamos como `id=`. Funciona pra qualquer variante de
+    URL do Drive (.../view, .../view?usp=sharing, .../edit, etc.).
+    """
+    try:
+        import gdown  # type: ignore
+    except ImportError:
+        die(
+            "gdown não instalado. Roda: "
+            "$KOBE_CLAUDE_CWD/.venv/bin/pip install gdown"
+        )
+    m = re.search(r"drive\.google\.com/file/d/([\w-]+)", url)
+    if not m:
+        die(f"não consegui extrair file_id da URL do Drive: {url}")
+    file_id = m.group(1)
+    log(f"baixando do Google Drive (id={file_id[:8]}…)…")
+    # Passar diretório como output (com / no final) faz o gdown usar o
+    # nome original do arquivo, em vez de renomear pra "drive-input".
+    output_dir = str(workdir) + os.sep
+    try:
+        result_path = gdown.download(id=file_id, output=output_dir, quiet=False)
+    except Exception as exc:  # noqa: BLE001
+        die(f"gdown falhou baixando do Drive: {exc}")
+    if not result_path:
+        die("gdown não retornou path — Drive recusou o download (arquivo privado?)")
+    path = Path(result_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        die(f"gdown retornou path inválido ou vazio: {path}")
+    log(f"baixado: {path.name} ({path.stat().st_size // 1024 // 1024}MB)")
+    title = _filename_to_title(path.name)
+    return path, title
+
+
+def _acquire_direct(url: str, workdir: Path) -> tuple[Path, Optional[str]]:
+    """Baixa link direto (.mp3/.mp4/...) via urllib. Retorna (path, title).
+
+    Título vem do nome do arquivo na URL (sem extensão), quando útil.
+    """
+    parsed = urllib.parse.urlparse(url)
+    filename = Path(parsed.path).name or "direct-input"
+    suffix = Path(filename).suffix.lower() or ".bin"
+    # Garante extensão coerente (alguns servers podem servir sem ela no path).
+    if not Path(filename).suffix:
+        filename = filename + suffix
+    dest = workdir / filename
+    log(f"baixando link direto → {dest.name}")
+    try:
+        urllib.request.urlretrieve(url, str(dest))
+    except (urllib.error.URLError, OSError) as exc:
+        die(f"download de link direto falhou: {exc}")
+    if not dest.is_file() or dest.stat().st_size == 0:
+        die(f"download retornou arquivo vazio: {dest}")
+    log(f"baixado: {dest.name} ({dest.stat().st_size // 1024 // 1024}MB)")
+    title = _filename_to_title(filename)
+    return dest, title
+
+
 def compress_if_needed(mp3: Path) -> Path:
     size = mp3.stat().st_size
     if size <= GROQ_MAX_BYTES:
@@ -328,10 +467,18 @@ def split_chunks(mp3: Path, seconds: int) -> list[Path]:
 
 # ───────────────────────── Whisper ───────────────────────────────────
 
+class WhisperFailure(RuntimeError):
+    """Erro recuperável do Whisper — main captura e tenta fallback pra AssemblyAI."""
+
+
 def whisper_segments(path: Path, api_key: str) -> list[dict]:
     """Chama Whisper com verbose_json. Devolve lista de segments dict.
 
     Cada segment tem ao menos `start` (s), `end` (s) e `text`.
+
+    Levanta `WhisperFailure` em qualquer erro do SDK/API — o caller pode
+    capturar pra tentar fallback. Erros não-recuperáveis (SDK ausente)
+    seguem chamando `die()` direto.
     """
     try:
         from groq import Groq
@@ -349,7 +496,7 @@ def whisper_segments(path: Path, api_key: str) -> list[dict]:
             response_format="verbose_json",
         )
     except Exception as exc:  # noqa: BLE001
-        die(f"Groq Whisper falhou: {exc}")
+        raise WhisperFailure(f"Groq Whisper falhou: {exc}") from exc
 
     if isinstance(res, dict):
         segments = res.get("segments") or []
@@ -371,52 +518,7 @@ def _get(obj: Any, key: str, default: Any) -> Any:
     return getattr(obj, key, default)
 
 
-# ───────────────────────── pyannote (speaker diarization) ───────────
-
-def pyannote_diarize(mp3: Path, hf_token: str) -> list[tuple[float, float, str]]:
-    """Roda pyannote speaker-diarization-3.1 e devolve turns `[(start, end, label)]`.
-
-    Importação lazy: só chama quando `--diarize` foi passado, evita
-    forçar o pip de pyannote.audio (+torch ~500MB) em usuários que só
-    querem transcrição limpa.
-
-    Modelo precisa ser baixado uma vez (~500MB → `~/.cache/huggingface/`)
-    e exige aceite manual dos termos em
-    https://huggingface.co/pyannote/speaker-diarization-3.1 com o mesmo
-    HF token.
-    """
-    try:
-        from pyannote.audio import Pipeline  # type: ignore
-    except ImportError:
-        die(
-            "pyannote.audio não instalado. Roda: "
-            "$KOBE_CLAUDE_CWD/.venv/bin/pip install pyannote.audio "
-            "(~500MB com torch). Veja o runbook em docs/runbooks/."
-        )
-    log("carregando pipeline pyannote/speaker-diarization-3.1…")
-    try:
-        pipeline = Pipeline.from_pretrained(
-            PYANNOTE_PIPELINE, use_auth_token=hf_token
-        )
-    except Exception as exc:  # noqa: BLE001
-        die(
-            f"pyannote: falha carregando pipeline ({exc}). "
-            "Verifica se o HF_TOKEN é válido e se você aceitou os termos "
-            "em https://huggingface.co/pyannote/speaker-diarization-3.1"
-        )
-    log("rodando diarization (pode levar 5-10min por hora de áudio na CPU)…")
-    try:
-        annotation = pipeline(str(mp3))
-    except Exception as exc:  # noqa: BLE001
-        die(f"pyannote falhou processando áudio: {exc}")
-
-    turns: list[tuple[float, float, str]] = []
-    for turn, _, label in annotation.itertracks(yield_label=True):
-        turns.append((float(turn.start), float(turn.end), str(label)))
-    if not turns:
-        log("pyannote não encontrou turns — voltando pra speaker único")
-    return turns
-
+# ───────────────────────── speaker attribution ──────────────────────
 
 def _attribute_and_group_by_speaker(
     sentences: list[tuple[float, float, str]],
@@ -701,6 +803,98 @@ def youtube_oembed_title(url: str) -> str | None:
     return None
 
 
+# ──────────────── cache leve de intermediários ──────────────────────
+
+# Cache só guarda os "intermediates" do pipeline (segments do
+# Whisper/AssemblyAI + speakers turns) — NÃO o mp3/mp4 bruto. Mp3 de 30MB
+# x dezenas de transcrições viraria GBs em disco; segments JSON pesam
+# ~100KB cada. ROI: re-pedir a mesma URL em formato diferente (TXT↔HTML)
+# pula download + engine inteiros, só re-renderiza.
+#
+# Layout: $KOBE_HOME/.local/atrus-cache/<sha1-url-16>/{meta,segments,speakers}.json
+# TTL: 7 dias por mtime, gerenciado pelo cleanup loop do bot/cleanup.py.
+
+_CACHE_DIR_NAME = "atrus-cache"
+
+
+def _cache_key(url: str, diarize: bool) -> str:
+    """Hash determinístico por (URL, --diarize). Diarize muda engine →
+    output incompatível, então faz parte da chave."""
+    raw = url + ("|diarize" if diarize else "")
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_dir(url: str, diarize: bool) -> Path:
+    kobe_home = os.environ.get("KOBE_HOME") or str(Path.home() / "kobe")
+    return Path(kobe_home) / ".local" / _CACHE_DIR_NAME / _cache_key(url, diarize)
+
+
+def _cache_load(
+    url: str, diarize: bool
+) -> Optional[tuple[list[dict], Optional[list[tuple[float, float, str]]], str]]:
+    """Lê cache pra `(url, diarize)`. Retorna (segments, speakers, engine_used)
+    ou None se ausente/inválido. Toca mtime pra reset do TTL."""
+    cdir = _cache_dir(url, diarize)
+    segments_file = cdir / "segments.json"
+    meta_file = cdir / "meta.json"
+    if not segments_file.is_file() or not meta_file.is_file():
+        return None
+    try:
+        segments = json.loads(segments_file.read_text())
+        meta = json.loads(meta_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(segments, list) or not segments:
+        return None
+    speakers: Optional[list[tuple[float, float, str]]] = None
+    if diarize:
+        speakers_file = cdir / "speakers.json"
+        if not speakers_file.is_file():
+            return None  # cache incompleto pra modo speakers
+        try:
+            raw = json.loads(speakers_file.read_text())
+            speakers = [tuple(t) for t in raw]
+        except (OSError, json.JSONDecodeError):
+            return None
+    # Touch: bumpa mtime pra cache em uso resetar o TTL.
+    try:
+        cdir.touch()
+    except OSError:
+        pass
+    engine_used = meta.get("engine_used", "cache")
+    return segments, speakers, engine_used
+
+
+def _cache_save(
+    url: str,
+    diarize: bool,
+    segments: list[dict],
+    speakers: Optional[list[tuple[float, float, str]]],
+    engine_used: str,
+    title: Optional[str],
+) -> None:
+    """Grava cache (best-effort — erro é só logado, não derruba o pipeline)."""
+    cdir = _cache_dir(url, diarize)
+    try:
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "segments.json").write_text(json.dumps(segments, ensure_ascii=False))
+        if speakers is not None:
+            (cdir / "speakers.json").write_text(
+                json.dumps([list(t) for t in speakers], ensure_ascii=False)
+            )
+        meta = {
+            "url": url,
+            "diarize": diarize,
+            "created_at": datetime.now().isoformat(),
+            "engine_used": engine_used,
+            "title": title or "",
+        }
+        (cdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        log(f"cache: salvo em {cdir.name}")
+    except OSError as exc:
+        log(f"cache: falha gravando (segue sem cachear): {exc}")
+
+
 def _default_output_dir() -> Path:
     """Onde gravar a transcrição final.
 
@@ -727,7 +921,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--diarize", action="store_true",
-        help="identifica speakers via pyannote local (requer HF_TOKEN no env + termos aceitos)",
+        help="identifica speakers via AssemblyAI (requer ASSEMBLYAI_API_KEY no env)",
     )
     parser.add_argument(
         "--output-dir", default=None,
@@ -737,55 +931,142 @@ def main() -> None:
         "--title", default=None,
         help="título humano da transcrição (usado no HTML; default: o que vier do Firecrawl, ou slug da URL)",
     )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="ignora cache de segments (re-baixa e re-transcreve mesmo se o cache existir)",
+    )
     args = parser.parse_args()
 
-    fc_key = require_env("FIRECRAWL_API_KEY")
-    groq_key = require_env("GROQ_API_KEY")
-    hf_token = os.environ.get("HF_TOKEN") if args.diarize else None
-    if args.diarize and not hf_token:
-        die("--diarize requer HF_TOKEN no env. Veja docs/runbooks/pyannote-setup.md.")
+    # Firecrawl é só pra URLs de página (YouTube/Vimeo/podcast/etc).
+    # Drive e link direto pulam Firecrawl, então só exigimos a key quando
+    # a URL realmente precisa dela.
+    need_firecrawl = not (_is_google_drive(args.url) or _is_direct_av_link(args.url))
+    fc_key: Optional[str] = require_env("FIRECRAWL_API_KEY") if need_firecrawl else None
+
+    # Caminho sem speakers continua via Groq Whisper (qualidade superior em
+    # PT-BR e mais barato pra áudios curtos). Caminho com speakers vai pelo
+    # AssemblyAI (transcrição + diarização em chamada única — substitui
+    # pyannote + Whisper de uma vez, sem CPU local saturada).
+    if args.diarize:
+        aai_key = require_env("ASSEMBLYAI_API_KEY")
+        groq_key = None
+    else:
+        aai_key = None
+        groq_key = require_env("GROQ_API_KEY")
 
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_url, scraped_title = firecrawl_scrape(args.url, fc_key)
-    # Prioridade do título: --title (override) > oEmbed YouTube (canônico)
-    # > metadata.title do Firecrawl (pode vir traduzido) > slug do video ID.
-    oembed_title = youtube_oembed_title(args.url) if not args.title else None
-    title = args.title or oembed_title or scraped_title or _slug_from_url(args.url)
-    if oembed_title:
-        log(f"título via YouTube oEmbed: {oembed_title!r}")
-
     workdir = Path(tempfile.mkdtemp(prefix="atrus-"))
-    mp3 = workdir / "input.mp3"
+    # `engine_used` é gravado na 2ª linha do stdout pra o worker poder
+    # avisar o operador quando rolou fallback. Valores: "groq-whisper",
+    # "assemblyai", "assemblyai-fallback", "cache".
+    engine_used = "unknown"
+    segments: Optional[list[dict]] = None
+    speakers: Optional[list[tuple[float, float, str]]] = None
+    # Tenta cache ANTES de criar workdir/baixar/transcrever. Se hit, pula
+    # tudo isso e vai direto pro render — economiza minutos e $$.
+    title: Optional[str] = None
+    if not args.no_cache:
+        cached = _cache_load(args.url, args.diarize)
+        if cached is not None:
+            segments, speakers, prev_engine = cached
+            engine_used = "cache"  # comunica reuso pro worker/operador
+            log(
+                f"cache HIT: reusando {len(segments)} segmentos "
+                f"(engine original: {prev_engine})"
+            )
+
     try:
-        download(audio_url, mp3)
-        mp3 = compress_if_needed(mp3)
+        if segments is None:
+            # Cache miss — pipeline completo (download + compress + engine).
+            # acquire_audio decide entre Drive (gdown), link direto (urllib)
+            # ou Firecrawl conforme a URL. Retorna path local + título (se
+            # vier do scrape; None nos outros casos).
+            audio_path, scraped_title = acquire_audio(args.url, fc_key, workdir)
+            # Prioridade do título: --title (override) > oEmbed YouTube (canônico)
+            # > metadata.title do Firecrawl (pode vir traduzido) > slug da URL.
+            oembed_title = youtube_oembed_title(args.url) if not args.title else None
+            title = args.title or oembed_title or scraped_title or _slug_from_url(args.url)
+            if oembed_title:
+                log(f"título via YouTube oEmbed: {oembed_title!r}")
+            mp3 = compress_if_needed(audio_path)
 
-        speakers: list[tuple[float, float, str]] | None = None
-        if args.diarize:
-            # pyannote precisa do áudio inteiro (sem chunking) pra manter
-            # labels coerentes — roda ANTES do Whisper, no mesmo arquivo
-            # já comprimido (mono 16kbps já basta pra diarization).
-            speakers = pyannote_diarize(mp3, hf_token)  # type: ignore[arg-type]
+            if args.diarize:
+                # AssemblyAI faz transcrição + diarização numa única chamada;
+                # devolve segments (já quebrados por frase via timestamps
+                # interpolados das utterances) + speakers_turns compatíveis com
+                # `_attribute_and_group_by_speaker`.
+                from assemblyai_engine import transcribe_with_speakers
+                log(f"transcrevendo via AssemblyAI no formato '{args.format}' com speakers…")
+                try:
+                    segments, speakers = transcribe_with_speakers(mp3, aai_key)  # type: ignore[arg-type]
+                    engine_used = "assemblyai"
+                except RuntimeError as exc:
+                    die(str(exc))
+            else:
+                log(f"transcrevendo via Groq Whisper no formato '{args.format}'…")
+                try:
+                    segments = transcribe_all(mp3, groq_key)  # type: ignore[arg-type]
+                    engine_used = "groq-whisper"
+                except WhisperFailure as exc:
+                    # Fallback automático pra AssemblyAI quando ASSEMBLYAI_API_KEY
+                    # disponível — cobre 429 de rate limit e erros de rede do
+                    # Groq. Sem a key, morre com o erro original.
+                    aai_fallback_key = os.environ.get("ASSEMBLYAI_API_KEY")
+                    if not aai_fallback_key:
+                        die(f"Whisper falhou e não há ASSEMBLYAI_API_KEY pra fallback: {exc}")
+                    log(f"Whisper falhou ({exc}). Caindo pra AssemblyAI sem speakers…")
+                    from assemblyai_engine import transcribe_without_speakers
+                    try:
+                        segments = transcribe_without_speakers(mp3, aai_fallback_key)
+                        engine_used = "assemblyai-fallback"
+                    except RuntimeError as exc2:
+                        die(f"Whisper falhou e AssemblyAI fallback também: {exc2}")
 
-        log(f"transcrevendo no formato '{args.format}'{' com speakers' if args.diarize else ''}…")
-        segments = transcribe_all(mp3, groq_key)
+            # Cache save: só quando o pipeline rodou de fato (cache miss),
+            # com sucesso. Em cache hit não salvamos (já está lá). Falha
+            # de cache é silenciosa — não derruba a transcrição.
+            if segments and not args.no_cache:
+                _cache_save(args.url, args.diarize, segments, speakers, engine_used, title)
+        else:
+            # Cache hit: já temos segments. Só precisamos do título pra render.
+            # Sem chamada de rede aqui — usa oEmbed cache local se for YouTube;
+            # outros casos caem no slug da URL.
+            oembed_title = youtube_oembed_title(args.url) if not args.title else None
+            title = args.title or oembed_title or _slug_from_url(args.url)
+
         if not segments:
             die("transcrição vazia")
 
         slug = _slug_from_url(args.url)
         suffix_speakers = "-speakers" if args.diarize else ""
+        # Header indicando a engine usada — operador pode comparar
+        # transcrições depois sem precisar consultar logs.
+        engine_label = {
+            "groq-whisper": "Groq Whisper-large-v3",
+            "assemblyai": "AssemblyAI (transcrição + speakers)",
+            "assemblyai-fallback": "AssemblyAI (FALLBACK — Whisper indisponível)",
+            "cache": "cache (transcrição reaproveitada do cache local)",
+        }.get(engine_used, engine_used)
         if args.format == "analysis":
-            content = render_analysis(segments, speakers=speakers)
+            txt_header = f"# Transcrito via: {engine_label}\n# Fonte: {args.url}\n\n"
+            content = txt_header + render_analysis(segments, speakers=speakers)
             out_path = output_dir / f"{slug}-analysis{suffix_speakers}.txt"
         else:
-            content = render_reading(segments, title, args.url, speakers=speakers)
+            content = render_reading(
+                segments, title, args.url, speakers=speakers,
+            )
+            # Injeta um comentário HTML antes de <!DOCTYPE> indicando engine.
+            content = f"<!-- Transcrito via: {engine_label} -->\n{content}"
             out_path = output_dir / f"{slug}-reading{suffix_speakers}.html"
 
         out_path.write_text(content, encoding="utf-8")
-        # stdout = path do arquivo final (pra o subagente capturar)
+        # stdout — duas linhas:
+        #   1: path do arquivo final (compat com versões antigas do worker)
+        #   2: engine=<id>  (worker novo lê pra avisar fallback ao operador)
         print(str(out_path))
+        print(f"engine={engine_used}")
     finally:
         for f in workdir.glob("*"):
             try:
