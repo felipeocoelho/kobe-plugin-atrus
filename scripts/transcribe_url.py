@@ -212,11 +212,26 @@ def firecrawl_scrape(url: str, api_key: str) -> tuple[str, str | None]:
             f"(versão incompatível). dir={[a for a in dir(app) if not a.startswith('_')][:20]}"
         )
 
+    # Páginas pesadas (ex: youtube.com/live, com player + chat ao vivo) podem
+    # estourar o timeout default do Firecrawl. FIRECRAWL_TIMEOUT_MS permite
+    # subir o orçamento sem mexer no código. Sem a env, mantém o default do
+    # SDK (compat total com o comportamento anterior).
+    timeout_ms_raw = os.environ.get("FIRECRAWL_TIMEOUT_MS")
+    extra: dict = {}
+    if timeout_ms_raw:
+        try:
+            extra["timeout"] = int(timeout_ms_raw)
+        except ValueError:
+            log(f"FIRECRAWL_TIMEOUT_MS inválido ({timeout_ms_raw!r}); ignorando")
+
     try:
-        result = scrape_fn(url, formats=["audio"])
+        result = scrape_fn(url, formats=["audio"], **extra)
     except TypeError:
         try:
-            result = scrape_fn(url, params={"formats": ["audio"]})
+            params = {"formats": ["audio"]}
+            if "timeout" in extra:
+                params["timeout"] = extra["timeout"]
+            result = scrape_fn(url, params=params)
         except Exception as exc:  # noqa: BLE001
             die(f"Firecrawl falhou (params fallback): {exc}")
     except Exception as exc:  # noqa: BLE001
