@@ -57,9 +57,10 @@ escolha da engine de produção fica com o operador; a troca é um flip de env, 
   (Whisper sem `language`; AssemblyAI `language_detection` no fallback) + cache key `|autolang`.
   Teste do parser/batcher com tradutor fake (12 checagens) + smoke REAL via Groq (tradução
   EN→pt-br correta, timestamps idênticos ao original — sync provado)
-- commit 4 — manifest 6 formatos (2 slash novos, deps `openai`, envs `OPENAI_API_KEY`/
+- `b645dad` — manifest 6 formatos (2 slash novos, deps `openai`, envs `OPENAI_API_KEY`/
   `ATRUS_TRANSLATE_ENGINE`, bump v0.5.0) + agent def pergunta `[1..6]` + mapa comando→--format +
   exceção da regra "não traduza" p/ o formato traduzido + `requirements.txt`
+- commit 5 (chore) — `.gitignore`: ignora `.local/` (convenção de rascunhos do operador)
 
 **Reversão:** cada commit é atômico e revertível via `git revert <hash>`; nenhum arquivo
 existente é removido, mudanças são aditivas (novos formatos, código atual intocado).
