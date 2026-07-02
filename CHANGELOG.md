@@ -37,10 +37,21 @@ sobreposição, e preservação idêntica dos timestamps entre original e traduz
 tradução testado com tradutor fake (sem API). Smoke ponta a ponta no dev VPS via cache hit.
 _(Detalhe preenchido conforme os commits avançam.)_
 
+**Descoberta durante a execução (engine de tradução):** o `OPENAI_API_KEY` do ambiente está
+sem quota (429 `insufficient_quota`). Por isso `translate.py` virou **multi-engine**
+selecionável por `ATRUS_TRANSLATE_ENGINE` — `openai` (default, escolha do operador) ou `groq`
+(`llama-3.3-70b-versatile`, mesma chave do Whisper, com quota). O fallback por bloco garantiu
+que mesmo com a engine sem quota o SRT saiu válido (texto original, timestamps intactos). A
+escolha da engine de produção fica com o operador; a troca é um flip de env, sem mexer em código.
+
 **Commits (progresso):**
 - `06b5101` — núcleo SRT (render_srt, _format_srt_timestamp, guarda de timing) + testes
 - commit 2 — `--format=srt` no transcribe_url (branch sem header) + worker; smoke de integração
   via cache hit sintético ok (SRT reaproveita o cache do caminho sem-speakers)
+- commit 3 — `translate.py` multi-engine + `--format=srt_ptbr` + auto-detecção de idioma
+  (Whisper sem `language`; AssemblyAI `language_detection` no fallback) + cache key `|autolang`.
+  Teste do parser/batcher com tradutor fake (12 checagens) + smoke REAL via Groq (tradução
+  EN→pt-br correta, timestamps idênticos ao original — sync provado)
 
 **Reversão:** cada commit é atômico e revertível via `git revert <hash>`; nenhum arquivo
 existente é removido, mudanças são aditivas (novos formatos, código atual intocado).
