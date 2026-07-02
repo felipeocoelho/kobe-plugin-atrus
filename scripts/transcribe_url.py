@@ -637,6 +637,27 @@ def _format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+# Duração mínima de um bloco SRT. Evita cue de duração ~0 (frase muito
+# curta com start≈end), que players ignoram ou fazem "piscar" na tela.
+SRT_MIN_CUE_SECONDS = 1.2
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    """Converte segundos → `HH:MM:SS,mmm` (padrão SubRip, vírgula decimal).
+
+    Diferente de `_format_timestamp` (que faz `M:SS` pra leitura humana):
+    aqui é o formato estrito do SubRip, com horas zero-padded e
+    milissegundos separados por vírgula — o que players/editores esperam.
+    """
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def _segments_to_sentences(
     segments: list[dict],
 ) -> list[tuple[float, float, str]]:
@@ -771,6 +792,79 @@ def render_reading(
         date=datetime.now().strftime("%d/%m/%Y"),
         body="\n".join(body_parts),
     )
+
+
+def _srt_cue_times(
+    sentences: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str]]:
+    """Normaliza os tempos das frases pra blocos SRT válidos.
+
+    - Garante `end > start` (duração mínima `SRT_MIN_CUE_SECONDS`) pra não
+      emitir cue de duração ~0.
+    - Clampa `end` ao `start` do próximo bloco quando há sobreposição, pra
+      duas legendas não aparecerem ao mesmo tempo na tela.
+
+    Não altera o texto nem reordena — só sanitiza os tempos.
+    """
+    n = len(sentences)
+    out: list[tuple[float, float, str]] = []
+    for i, (start, end, text) in enumerate(sentences):
+        start = max(0.0, start)
+        end = max(end, start + SRT_MIN_CUE_SECONDS)
+        if i + 1 < n:
+            next_start = max(0.0, sentences[i + 1][0])
+            # Só clampa se o próximo começa depois deste start (senão manter
+            # a duração mínima é mais seguro que gerar end < start).
+            if next_start > start and end > next_start:
+                end = next_start
+        out.append((start, end, text))
+    return out
+
+
+def render_srt(
+    segments: list[dict],
+    texts: Optional[list[str]] = None,
+) -> str:
+    """Renderiza legenda SubRip (.srt).
+
+    Cada FRASE (via `_segments_to_sentences` — timing por segmento do ASR,
+    granularidade de frase) vira um bloco numerado no formato
+    `HH:MM:SS,mmm --> HH:MM:SS,mmm`. NUNCA agrega por parágrafo: a unidade
+    de legenda é a frase, com os timestamps que o ASR já produziu.
+
+    `texts` (opcional): quando fornecido, substitui o texto de cada bloco
+    (mesma ordem e contagem das frases originais) — é o hook do formato
+    traduzido, que troca só o texto e **preserva os timestamps intactos**.
+    Levanta ValueError se a contagem não bater (segurança de sincronismo).
+    """
+    sentences = _segments_to_sentences(segments)
+    if texts is not None:
+        if len(texts) != len(sentences):
+            raise ValueError(
+                f"render_srt: len(texts)={len(texts)} != "
+                f"len(sentences)={len(sentences)} — sincronismo quebraria"
+            )
+        sentences = [
+            (start, end, texts[i])
+            for i, (start, end, _old) in enumerate(sentences)
+        ]
+
+    cues = _srt_cue_times(sentences)
+    blocks: list[str] = []
+    for idx, (start, end, text) in enumerate(cues, start=1):
+        blocks.append(
+            f"{idx}\n"
+            f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}\n"
+            f"{text}"
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def srt_sentence_texts(segments: list[dict]) -> list[str]:
+    """Extrai só o texto de cada frase, na mesma ordem/contagem que
+    `render_srt` usa. Serve pra alimentar a tradução (formato traduzido)
+    e casar 1:1 com o `texts=` do `render_srt`."""
+    return [text for _s, _e, text in _segments_to_sentences(segments)]
 
 
 # ───────────────────────── utilidades ────────────────────────────────
