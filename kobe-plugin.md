@@ -1,17 +1,19 @@
 ---
 name: atrus
 visibility: public
-version: 0.4.0
-description: "Transcrição de URLs de mídia. Aceita YouTube/Vimeo/Spotify/podcast (via Firecrawl), Google Drive (via gdown — baixa o arquivo direto), e links diretos pra .mp3/.mp4/.m4a/.wav etc. (urllib). Caminho sem speakers: Groq Whisper (com fallback automático pra AssemblyAI). Caminho com speakers: AssemblyAI (transcrição + diarização). Toda execução detached via kobe-dispatch — operador recebe progresso em background e segue conversando enquanto roda. Quatro formatos: TXT ou HTML, com ou sem speakers. TXT tem timestamp por frase; HTML tem 1 timestamp por parágrafo. Saída em `user-data/artifacts/transcricoes/`. Múltiplas URLs sempre rodam em paralelo. IMPORTANTE — delegue direto sem perguntar formato; o subagente é quem pergunta `[1]/[2]/[3]/[4]` quando o formato não veio no slash."
+version: 0.5.0
+description: "Transcrição de URLs de mídia. Aceita YouTube/Vimeo/Spotify/podcast (via Firecrawl), Google Drive (via gdown — baixa o arquivo direto), e links diretos pra .mp3/.mp4/.m4a/.wav etc. (urllib). Caminho sem speakers: Groq Whisper (com fallback automático pra AssemblyAI). Caminho com speakers: AssemblyAI (transcrição + diarização). Toda execução detached via kobe-dispatch — operador recebe progresso em background e segue conversando enquanto roda. Seis formatos: TXT ou HTML (com ou sem speakers), legenda .srt (SubRip), e legenda .srt traduzida pra pt-br. TXT tem timestamp por frase; HTML tem 1 timestamp por parágrafo; o .srt tem timestamps de bloco HH:MM:SS,mmm por frase. Saída em `user-data/artifacts/transcricoes/`. Múltiplas URLs sempre rodam em paralelo. IMPORTANTE — delegue direto sem perguntar formato; o subagente é quem pergunta `[1]..[6]` quando o formato não veio no slash."
 triggers:
   - "operador manda link de YouTube, Vimeo, Spotify, podcast ou pede 'transcreve esse vídeo/link'"
-  - "comando `/transcrever <url1> <url2> ...` (sem formato — subagente pergunta `[1] TXT/[2] HTML/[3] TXT+speakers/[4] HTML+speakers`)"
+  - "comando `/transcrever <url1> <url2> ...` (sem formato — subagente pergunta `[1]..[6]`)"
   - "comando `/transcrever_txt <url1> <url2> ...` (TXT sem speakers)"
   - "comando `/transcrever_leitura <url1> <url2> ...` (HTML sem speakers)"
   - "comando `/transcrever_txt_speakers <url1> <url2> ...` (TXT + speakers via AssemblyAI)"
   - "comando `/transcrever_leitura_speakers <url1> <url2> ...` (HTML + speakers via AssemblyAI)"
-  - "também aceita as variantes com hífen (`/transcrever-txt`, `/transcrever-leitura`, etc.) por retrocompat — o subagente normaliza"
-  - "URL solta sem slash → subagente pergunta o formato `[1]/[2]/[3]/[4]` na primeira mensagem"
+  - "comando `/transcrever_legenda <url1> <url2> ...` (legenda .srt SubRip)"
+  - "comando `/transcrever_legenda_traduzida <url1> <url2> ...` (legenda .srt traduzida pra pt-br)"
+  - "também aceita as variantes com hífen (`/transcrever-txt`, `/transcrever-legenda`, etc.) por retrocompat — o subagente normaliza"
+  - "URL solta sem slash → subagente pergunta o formato `[1]..[6]` na primeira mensagem"
 slash_commands:
   - name: transcrever
     description: "Transcrever URL (subagente pergunta o formato)"
@@ -23,46 +25,60 @@ slash_commands:
     description: "Transcrever URL em TXT com identificação de speakers"
   - name: transcrever_leitura_speakers
     description: "Transcrever URL em HTML pra leitura com speakers"
+  - name: transcrever_legenda
+    description: "Transcrever URL em legenda .srt (SubRip)"
+  - name: transcrever_legenda_traduzida
+    description: "Transcrever URL em legenda .srt traduzida pra pt-br"
 agent_definition: claude/agents/atrus.md
 dependencies:
   python:
     - firecrawl-py  # scrape de URLs de página (YouTube/Vimeo/Spotify/podcast)
     - assemblyai    # transcrição + diarização (caminho com speakers, fallback)
     - gdown         # download de arquivos do Google Drive (bypass Firecrawl)
+    - openai        # tradução da legenda pt-br (engine default; ver ATRUS_TRANSLATE_ENGINE)
   system:
     - ffmpeg
 env:
   required:
     - FIRECRAWL_API_KEY
-    - GROQ_API_KEY        # usado no caminho sem speakers (Whisper)
+    - GROQ_API_KEY        # Whisper (sem speakers) + engine 'groq' de tradução
   optional:
-    - ASSEMBLYAI_API_KEY  # obrigatório se quiser usar /transcrever-speakers ou /transcrever-leitura-speakers
+    - ASSEMBLYAI_API_KEY  # obrigatório p/ /transcrever_txt_speakers e /transcrever_leitura_speakers
+    - OPENAI_API_KEY      # tradução da legenda pt-br quando ATRUS_TRANSLATE_ENGINE=openai (default)
+    - ATRUS_TRANSLATE_ENGINE  # 'openai' (default) ou 'groq' — engine de tradução do /transcrever_legenda_traduzida
 ---
 
 # Atrus — transcritor de URLs
 
 Plugin público do Kobe pra transcrição de URLs de mídia. Resolve o problema clássico de VPS bloqueado pelo YouTube/Vimeo: **Firecrawl** atua como proxy residencial (pago via API) e devolve URL assinada do MP3.
 
-Dois caminhos, conforme o formato escolhido:
+Caminhos, conforme o formato escolhido:
 
-- **Sem speakers** (`/transcrever`, `/transcrever-leitura`): **Groq Whisper-large-v3** (PT-BR, temperature=0). Pipeline síncrono, rápido, no turno do agente.
-- **Com speakers** (`/transcrever-speakers`, `/transcrever-leitura-speakers`): **AssemblyAI** com `speaker_labels=True` (transcrição + diarização numa única chamada à nuvem deles). Pipeline detached via `kobe-dispatch`: o subagente dispara e volta o turno em ~1s; o worker em background entrega o resultado pelo Telegram. Múltiplas URLs correm em paralelo.
+- **Sem speakers** (`/transcrever_txt`, `/transcrever_leitura`, `/transcrever_legenda`): **Groq Whisper-large-v3** (PT-BR, temperature=0). Pipeline rápido.
+- **Com speakers** (`/transcrever_txt_speakers`, `/transcrever_leitura_speakers`): **AssemblyAI** com `speaker_labels=True` (transcrição + diarização numa única chamada à nuvem deles). Múltiplas URLs correm em paralelo.
+- **Legenda traduzida** (`/transcrever_legenda_traduzida`): Whisper com **auto-detecção** do idioma de origem + tradução dos blocos pra pt-br via LLM (`ATRUS_TRANSLATE_ENGINE`: openai/groq). Toda execução é detached via `kobe-dispatch`.
 
-## Quatro formatos de saída
+## Seis formatos de saída
 
 | Slash | Formato base | Speakers? | Engine | Saída |
 |---|---|---|---|---|
-| `/transcrever <urls>` | — | — | — | Sem qualifier — subagente pergunta `[1]/[2]/[3]/[4]` antes de processar |
+| `/transcrever <urls>` | — | — | — | Sem qualifier — subagente pergunta `[1]..[6]` antes de processar |
 | `/transcrever_txt <urls>` | analysis | não | Groq Whisper (com fallback) | `.txt` estilo TurboScribe — parágrafos de ~3 frases, cada frase prefixada por `(M:SS)` |
 | `/transcrever_leitura <urls>` | reading | não | Groq Whisper (com fallback) | `.html` standalone com 1 timestamp discreto no início de cada parágrafo |
 | `/transcrever_txt_speakers <urls>` | analysis | sim | AssemblyAI | `.txt` com blocos `Speaker 1`, `Speaker 2`… cada bloco contendo os parágrafos daquele falante |
 | `/transcrever_leitura_speakers <urls>` | reading | sim | AssemblyAI | `.html` com `<section class="speaker">` por falante, cabeçalho discreto + parágrafos |
+| `/transcrever_legenda <urls>` | srt | não | Groq Whisper (com fallback) | `.srt` SubRip — 1 bloco por frase, timestamps `HH:MM:SS,mmm --> HH:MM:SS,mmm` |
+| `/transcrever_legenda_traduzida <urls>` | srt_ptbr | não | Whisper (auto-lang) + LLM tradutor | `.srt` SubRip traduzido pra pt-br, **mesmos timestamps** do original |
 
-> Os 5 comandos aparecem no menu auto-complete do Telegram (`/`). As variantes com hífen (`/transcrever-txt`, `/transcrever-leitura`, etc.) continuam funcionando se você digitar manualmente — o subagente normaliza ambas as formas.
+> Os 7 comandos aparecem no menu auto-complete do Telegram (`/`). As variantes com hífen (`/transcrever-txt`, `/transcrever-legenda`, etc.) continuam funcionando se você digitar manualmente — o subagente normaliza ambas as formas.
 
 Sem speakers: derivados dos `segments[]` do Whisper-large-v3 (`verbose_json`), agrupados em frases por pontuação (`.!?`) ou por limite de palavras quando Whisper não pontua (28 palavras = força quebra). Parágrafos têm 3 frases.
 
 Com speakers: derivados das `utterances` do AssemblyAI (cada utterance já tem speaker label + texto + timestamps); cada utterance é quebrada em frases por `.!?` com timestamps interpolados proporcionalmente ao texto. O resto do render reutiliza o mesmo pipeline.
+
+Legenda `.srt`: cada **frase** (mesma quebra do TXT/HTML — timing por segmento do ASR, nunca agregação por parágrafo) vira um bloco SubRip. Guarda de timing: duração mínima de 1,2s e clamp contra sobreposição. O `.srt` **reaproveita o cache** do caminho sem-speakers (re-pedir uma URL já transcrita em TXT/HTML vira cache hit).
+
+Legenda traduzida: transcreve com auto-detecção do idioma, depois traduz **só o texto** de cada bloco (batch numerado por índice, fallback por bloco ao original) e reencaixa nos timestamps originais — o sincronismo é preservado por construção. Engine via `ATRUS_TRANSLATE_ENGINE` (`openai` gpt-4o-mini default, ou `groq` llama-3.3-70b).
 
 Se a URL chegar sem slash, o subagente pergunta o formato em texto: `[1] TXT / [2] HTML / [3] TXT+speakers / [4] HTML+speakers` e processa após a resposta.
 
@@ -114,7 +130,8 @@ Operador → Telegram → Kobe (agente principal)
 - Firecrawl: ~$0.01–0.05 por scrape de áudio
 - Groq Whisper-large-v3: ~$0.11 por hora de áudio (caminho sem speakers)
 - AssemblyAI: ~$0.37 por hora de áudio com speakers (Universal model + speaker_labels)
-- **Total sem speakers: < $0.20 por hora**. **Com speakers: < $0.50 por hora.**
+- Tradução da legenda pt-br: ~$0.01–0.02 por hora de áudio (gpt-4o-mini ou llama-3.3-70b) — desprezível
+- **Total sem speakers: < $0.20 por hora**. **Com speakers: < $0.50 por hora.** **Legenda traduzida: ~igual ao sem speakers + centavos.**
 
 Antes (pyannote local) era custo zero por uso, mas com saturação de CPU da VPS por horas — esse trade-off não escala.
 
@@ -131,8 +148,10 @@ systemctl --user restart kobe
 ## Variáveis de ambiente
 
 - `FIRECRAWL_API_KEY` — https://www.firecrawl.dev (obrigatório)
-- `GROQ_API_KEY` — já existe no Kobe-base, reusada pelo plugin (obrigatório p/ caminho sem speakers)
+- `GROQ_API_KEY` — já existe no Kobe-base, reusada pelo plugin (obrigatório p/ caminho sem speakers; também é a engine `groq` de tradução)
 - `ASSEMBLYAI_API_KEY` — https://www.assemblyai.com/app/account (obrigatório p/ caminho com speakers)
+- `OPENAI_API_KEY` — https://platform.openai.com (tradução da legenda pt-br quando `ATRUS_TRANSLATE_ENGINE=openai`, o default)
+- `ATRUS_TRANSLATE_ENGINE` — `openai` (default) ou `groq`. Escolhe a engine de tradução do `/transcrever_legenda_traduzida`. Use `groq` pra reusar a chave do Whisper sem depender de billing da OpenAI.
 
 ## Requisitos do Kobe-base
 
@@ -145,4 +164,6 @@ systemctl --user restart kobe
 - Vídeos privados / removidos / region-locked falham no Firecrawl.
 - Chunking Whisper de 10min mantém timestamps coerentes (offset somado) — só no caminho sem speakers.
 - Caminho com speakers (AssemblyAI) não faz chunking local — manda o arquivo inteiro pra eles processarem.
-- `language="pt"` hardcoded em ambos os engines — pra outros idiomas, edite no script.
+- Idioma de origem: `pt` fixo em TXT/HTML/legenda `.srt`; **auto-detectado** só no `/transcrever_legenda_traduzida` (que depois traduz pra pt-br). Pra transcrever direto em outro idioma sem traduzir, edite o script.
+- Legenda `.srt`: 1 bloco por frase; frases longas (fallback de 28 palavras) viram blocos longos na tela — aceitável pra legenda de bloco, sem split por caractere.
+- Legenda traduzida: se a engine de tradução falhar (ex: OpenAI sem quota), o fallback por bloco devolve o **texto original** naquele bloco — a legenda sai válida e sincronizada, mas sem tradução nesses trechos. Troque a engine via `ATRUS_TRANSLATE_ENGINE=groq` se a OpenAI não tiver billing.
