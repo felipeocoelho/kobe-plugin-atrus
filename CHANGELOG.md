@@ -37,7 +37,10 @@ sobreposição, e preservação idêntica dos timestamps entre original e traduz
 tradução testado com tradutor fake (sem API). Smoke ponta a ponta no dev VPS via cache hit.
 _(Detalhe preenchido conforme os commits avançam.)_
 
-**Commits:** (preenchido ao fim da sequência)
+**Commits (progresso):**
+- `06b5101` — núcleo SRT (render_srt, _format_srt_timestamp, guarda de timing) + testes
+- commit 2 — `--format=srt` no transcribe_url (branch sem header) + worker; smoke de integração
+  via cache hit sintético ok (SRT reaproveita o cache do caminho sem-speakers)
 
 **Reversão:** cada commit é atômico e revertível via `git revert <hash>`; nenhum arquivo
 existente é removido, mudanças são aditivas (novos formatos, código atual intocado).

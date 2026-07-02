@@ -1025,8 +1025,11 @@ def main() -> None:
     )
     parser.add_argument("url")
     parser.add_argument(
-        "--format", choices=("analysis", "reading"), default="analysis",
-        help="formato de saída: analysis (txt com timestamps por frase) ou reading (html, 1 timestamp por parágrafo)",
+        "--format", choices=("analysis", "reading", "srt"),
+        default="analysis",
+        help="formato de saída: analysis (txt, timestamp por frase), reading (html, "
+             "1 timestamp por parágrafo), srt (legenda SubRip), srt_ptbr (legenda "
+             "SubRip traduzida pra pt-br)",
     )
     parser.add_argument(
         "--diarize", action="store_true",
@@ -1162,6 +1165,13 @@ def main() -> None:
             txt_header = f"# Transcrito via: {engine_label}\n# Fonte: {args.url}\n\n"
             content = txt_header + render_analysis(segments, speakers=speakers)
             out_path = output_dir / f"{slug}-analysis{suffix_speakers}.txt"
+        elif args.format == "srt":
+            # Legenda SubRip: SEM header/comentário — o arquivo precisa começar
+            # direto no índice "1", senão players/editores recusam o parsing.
+            # Sempre sem speakers (legenda é trilha de texto), então ignora
+            # `suffix_speakers` e o path é só `-srt.srt`.
+            content = render_srt(segments)
+            out_path = output_dir / f"{slug}-srt.srt"
         else:
             content = render_reading(
                 segments, title, args.url, speakers=speakers,
