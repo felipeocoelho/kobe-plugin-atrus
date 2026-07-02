@@ -10,6 +10,9 @@ venv/
 *.log
 /tmp_audio/
 
+# Rascunhos/planos/testes ad-hoc — convenção .local (nunca vai pro git)
+.local/
+
 # IDE
 .vscode/
 .idea/

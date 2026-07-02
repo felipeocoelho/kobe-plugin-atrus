@@ -96,13 +96,21 @@ def _fmt_elapsed(secs: float) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="transcribe_url_worker")
     parser.add_argument("url")
-    parser.add_argument("--format", choices=("analysis", "reading"), default="analysis")
+    parser.add_argument(
+        "--format", choices=("analysis", "reading", "srt", "srt_ptbr"),
+        default="analysis",
+    )
     parser.add_argument("--diarize", action="store_true")
     parser.add_argument("--label", default="", help="texto pra mostrar no kobe-notify (default: URL truncada)")
     args = parser.parse_args()
 
     label = args.label or _short(args.url)
-    fmt_name = "TXT" if args.format == "analysis" else "HTML"
+    fmt_name = {
+        "analysis": "TXT",
+        "reading": "HTML",
+        "srt": "SRT",
+        "srt_ptbr": "SRT-PTBR",
+    }.get(args.format, args.format)
     speakers_tag = " + speakers" if args.diarize else ""
     _notify(f"▶️ atrus: iniciando ({fmt_name}{speakers_tag})\n{label}")
 

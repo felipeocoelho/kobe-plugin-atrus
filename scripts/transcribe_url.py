@@ -486,10 +486,17 @@ class WhisperFailure(RuntimeError):
     """Erro recuperável do Whisper — main captura e tenta fallback pra AssemblyAI."""
 
 
-def whisper_segments(path: Path, api_key: str) -> list[dict]:
+def whisper_segments(
+    path: Path, api_key: str, language: Optional[str] = "pt"
+) -> list[dict]:
     """Chama Whisper com verbose_json. Devolve lista de segments dict.
 
     Cada segment tem ao menos `start` (s), `end` (s) e `text`.
+
+    `language`: código ISO do idioma do áudio (`"pt"` default). Quando
+    `None`, o parâmetro é omitido e o Whisper **auto-detecta** o idioma —
+    usado pelo formato `srt_ptbr`, cujo áudio de origem costuma ser
+    estrangeiro (será traduzido pra pt-br depois).
 
     Levanta `WhisperFailure` em qualquer erro do SDK/API — o caller pode
     capturar pra tentar fallback. Erros não-recuperáveis (SDK ausente)
@@ -502,14 +509,16 @@ def whisper_segments(path: Path, api_key: str) -> list[dict]:
     client = Groq(api_key=api_key)
     with path.open("rb") as fh:
         audio_bytes = fh.read()
+    create_kwargs: dict[str, Any] = dict(
+        file=(path.name, audio_bytes),
+        model=WHISPER_MODEL,
+        temperature=0,
+        response_format="verbose_json",
+    )
+    if language:
+        create_kwargs["language"] = language
     try:
-        res = client.audio.transcriptions.create(
-            file=(path.name, audio_bytes),
-            model=WHISPER_MODEL,
-            language="pt",
-            temperature=0,
-            response_format="verbose_json",
-        )
+        res = client.audio.transcriptions.create(**create_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise WhisperFailure(f"Groq Whisper falhou: {exc}") from exc
 
@@ -592,12 +601,17 @@ def _attribute_and_group_by_speaker(
 
 # ───────────────────────── Whisper ───────────────────────────────────
 
-def transcribe_all(mp3: Path, groq_key: str) -> list[dict]:
+def transcribe_all(
+    mp3: Path, groq_key: str, language: Optional[str] = "pt"
+) -> list[dict]:
     """Devolve lista plana de segments com timestamps absolutos. Faz
-    chunking se necessário e ajusta o offset de cada chunk."""
+    chunking se necessário e ajusta o offset de cada chunk.
+
+    `language` é repassado ao Whisper (`None` = auto-detecção, usado pelo
+    formato traduzido)."""
     if mp3.stat().st_size <= GROQ_MAX_BYTES:
         log("transcrevendo (peça única)…")
-        return whisper_segments(mp3, groq_key)
+        return whisper_segments(mp3, groq_key, language=language)
 
     chunks = split_chunks(mp3, CHUNK_SECONDS)
     if not chunks:
@@ -606,7 +620,7 @@ def transcribe_all(mp3: Path, groq_key: str) -> list[dict]:
     for i, chunk in enumerate(chunks):
         offset = i * CHUNK_SECONDS
         log(f"transcrevendo chunk {i + 1}/{len(chunks)}…")
-        for seg in whisper_segments(chunk, groq_key):
+        for seg in whisper_segments(chunk, groq_key, language=language):
             all_segs.append({
                 "start": seg["start"] + offset,
                 "end": seg["end"] + offset,
@@ -635,6 +649,27 @@ def _format_timestamp(seconds: float) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+# Duração mínima de um bloco SRT. Evita cue de duração ~0 (frase muito
+# curta com start≈end), que players ignoram ou fazem "piscar" na tela.
+SRT_MIN_CUE_SECONDS = 1.2
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    """Converte segundos → `HH:MM:SS,mmm` (padrão SubRip, vírgula decimal).
+
+    Diferente de `_format_timestamp` (que faz `M:SS` pra leitura humana):
+    aqui é o formato estrito do SubRip, com horas zero-padded e
+    milissegundos separados por vírgula — o que players/editores esperam.
+    """
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def _segments_to_sentences(
@@ -773,6 +808,79 @@ def render_reading(
     )
 
 
+def _srt_cue_times(
+    sentences: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str]]:
+    """Normaliza os tempos das frases pra blocos SRT válidos.
+
+    - Garante `end > start` (duração mínima `SRT_MIN_CUE_SECONDS`) pra não
+      emitir cue de duração ~0.
+    - Clampa `end` ao `start` do próximo bloco quando há sobreposição, pra
+      duas legendas não aparecerem ao mesmo tempo na tela.
+
+    Não altera o texto nem reordena — só sanitiza os tempos.
+    """
+    n = len(sentences)
+    out: list[tuple[float, float, str]] = []
+    for i, (start, end, text) in enumerate(sentences):
+        start = max(0.0, start)
+        end = max(end, start + SRT_MIN_CUE_SECONDS)
+        if i + 1 < n:
+            next_start = max(0.0, sentences[i + 1][0])
+            # Só clampa se o próximo começa depois deste start (senão manter
+            # a duração mínima é mais seguro que gerar end < start).
+            if next_start > start and end > next_start:
+                end = next_start
+        out.append((start, end, text))
+    return out
+
+
+def render_srt(
+    segments: list[dict],
+    texts: Optional[list[str]] = None,
+) -> str:
+    """Renderiza legenda SubRip (.srt).
+
+    Cada FRASE (via `_segments_to_sentences` — timing por segmento do ASR,
+    granularidade de frase) vira um bloco numerado no formato
+    `HH:MM:SS,mmm --> HH:MM:SS,mmm`. NUNCA agrega por parágrafo: a unidade
+    de legenda é a frase, com os timestamps que o ASR já produziu.
+
+    `texts` (opcional): quando fornecido, substitui o texto de cada bloco
+    (mesma ordem e contagem das frases originais) — é o hook do formato
+    traduzido, que troca só o texto e **preserva os timestamps intactos**.
+    Levanta ValueError se a contagem não bater (segurança de sincronismo).
+    """
+    sentences = _segments_to_sentences(segments)
+    if texts is not None:
+        if len(texts) != len(sentences):
+            raise ValueError(
+                f"render_srt: len(texts)={len(texts)} != "
+                f"len(sentences)={len(sentences)} — sincronismo quebraria"
+            )
+        sentences = [
+            (start, end, texts[i])
+            for i, (start, end, _old) in enumerate(sentences)
+        ]
+
+    cues = _srt_cue_times(sentences)
+    blocks: list[str] = []
+    for idx, (start, end, text) in enumerate(cues, start=1):
+        blocks.append(
+            f"{idx}\n"
+            f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}\n"
+            f"{text}"
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def srt_sentence_texts(segments: list[dict]) -> list[str]:
+    """Extrai só o texto de cada frase, na mesma ordem/contagem que
+    `render_srt` usa. Serve pra alimentar a tradução (formato traduzido)
+    e casar 1:1 com o `texts=` do `render_srt`."""
+    return [text for _s, _e, text in _segments_to_sentences(segments)]
+
+
 # ───────────────────────── utilidades ────────────────────────────────
 
 def _slug_from_url(url: str) -> str:
@@ -832,24 +940,29 @@ def youtube_oembed_title(url: str) -> str | None:
 _CACHE_DIR_NAME = "atrus-cache"
 
 
-def _cache_key(url: str, diarize: bool) -> str:
-    """Hash determinístico por (URL, --diarize). Diarize muda engine →
-    output incompatível, então faz parte da chave."""
-    raw = url + ("|diarize" if diarize else "")
+def _cache_key(url: str, diarize: bool, autolang: bool = False) -> str:
+    """Hash determinístico por (URL, --diarize, autolang). Diarize muda a
+    engine e `autolang` muda o idioma da transcrição (pt forçado vs
+    auto-detecção) → outputs incompatíveis, então ambos entram na chave.
+
+    `autolang=False` reproduz exatamente a chave anterior — caches
+    existentes (TXT/HTML/SRT) continuam válidos e SRT reaproveita-os."""
+    raw = url + ("|diarize" if diarize else "") + ("|autolang" if autolang else "")
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _cache_dir(url: str, diarize: bool) -> Path:
+def _cache_dir(url: str, diarize: bool, autolang: bool = False) -> Path:
     kobe_home = os.environ.get("KOBE_HOME") or str(Path.home() / "kobe")
-    return Path(kobe_home) / ".local" / _CACHE_DIR_NAME / _cache_key(url, diarize)
+    return (Path(kobe_home) / ".local" / _CACHE_DIR_NAME
+            / _cache_key(url, diarize, autolang))
 
 
 def _cache_load(
-    url: str, diarize: bool
+    url: str, diarize: bool, autolang: bool = False
 ) -> Optional[tuple[list[dict], Optional[list[tuple[float, float, str]]], str]]:
-    """Lê cache pra `(url, diarize)`. Retorna (segments, speakers, engine_used)
-    ou None se ausente/inválido. Toca mtime pra reset do TTL."""
-    cdir = _cache_dir(url, diarize)
+    """Lê cache pra `(url, diarize, autolang)`. Retorna (segments, speakers,
+    engine_used) ou None se ausente/inválido. Toca mtime pra reset do TTL."""
+    cdir = _cache_dir(url, diarize, autolang)
     segments_file = cdir / "segments.json"
     meta_file = cdir / "meta.json"
     if not segments_file.is_file() or not meta_file.is_file():
@@ -887,9 +1000,10 @@ def _cache_save(
     speakers: Optional[list[tuple[float, float, str]]],
     engine_used: str,
     title: Optional[str],
+    autolang: bool = False,
 ) -> None:
     """Grava cache (best-effort — erro é só logado, não derruba o pipeline)."""
-    cdir = _cache_dir(url, diarize)
+    cdir = _cache_dir(url, diarize, autolang)
     try:
         cdir.mkdir(parents=True, exist_ok=True)
         (cdir / "segments.json").write_text(json.dumps(segments, ensure_ascii=False))
@@ -900,6 +1014,7 @@ def _cache_save(
         meta = {
             "url": url,
             "diarize": diarize,
+            "autolang": autolang,
             "created_at": datetime.now().isoformat(),
             "engine_used": engine_used,
             "title": title or "",
@@ -931,8 +1046,11 @@ def main() -> None:
     )
     parser.add_argument("url")
     parser.add_argument(
-        "--format", choices=("analysis", "reading"), default="analysis",
-        help="formato de saída: analysis (txt com timestamps por frase) ou reading (html, 1 timestamp por parágrafo)",
+        "--format", choices=("analysis", "reading", "srt", "srt_ptbr"),
+        default="analysis",
+        help="formato de saída: analysis (txt, timestamp por frase), reading (html, "
+             "1 timestamp por parágrafo), srt (legenda SubRip), srt_ptbr (legenda "
+             "SubRip traduzida pra pt-br)",
     )
     parser.add_argument(
         "--diarize", action="store_true",
@@ -969,6 +1087,17 @@ def main() -> None:
         aai_key = None
         groq_key = require_env("GROQ_API_KEY")
 
+    # Formato traduzido: idioma de origem é auto-detectado (o áudio costuma
+    # ser estrangeiro) e o texto é traduzido pra pt-br pós-transcrição via
+    # OpenAI. `autolang` separa o cache do caminho pt-forçado.
+    autolang = args.format == "srt_ptbr"
+    whisper_language: Optional[str] = None if autolang else "pt"
+    if autolang:
+        # Falha cedo se faltar a chave da engine de tradução selecionada
+        # (openai default, ou groq via ATRUS_TRANSLATE_ENGINE).
+        from translate import key_env_for, resolve_engine
+        require_env(key_env_for(resolve_engine()))
+
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -983,7 +1112,7 @@ def main() -> None:
     # tudo isso e vai direto pro render — economiza minutos e $$.
     title: Optional[str] = None
     if not args.no_cache:
-        cached = _cache_load(args.url, args.diarize)
+        cached = _cache_load(args.url, args.diarize, autolang)
         if cached is not None:
             segments, speakers, prev_engine = cached
             engine_used = "cache"  # comunica reuso pro worker/operador
@@ -1020,9 +1149,10 @@ def main() -> None:
                 except RuntimeError as exc:
                     die(str(exc))
             else:
-                log(f"transcrevendo via Groq Whisper no formato '{args.format}'…")
+                lang_note = "auto-detect" if whisper_language is None else whisper_language
+                log(f"transcrevendo via Groq Whisper no formato '{args.format}' (lang={lang_note})…")
                 try:
-                    segments = transcribe_all(mp3, groq_key)  # type: ignore[arg-type]
+                    segments = transcribe_all(mp3, groq_key, language=whisper_language)  # type: ignore[arg-type]
                     engine_used = "groq-whisper"
                 except WhisperFailure as exc:
                     # Fallback automático pra AssemblyAI quando ASSEMBLYAI_API_KEY
@@ -1034,7 +1164,12 @@ def main() -> None:
                     log(f"Whisper falhou ({exc}). Caindo pra AssemblyAI sem speakers…")
                     from assemblyai_engine import transcribe_without_speakers
                     try:
-                        segments = transcribe_without_speakers(mp3, aai_fallback_key)
+                        # autolang → AssemblyAI auto-detecta o idioma (áudio
+                        # estrangeiro do formato traduzido).
+                        segments = transcribe_without_speakers(
+                            mp3, aai_fallback_key,
+                            language_code=None if autolang else "pt",
+                        )
                         engine_used = "assemblyai-fallback"
                     except RuntimeError as exc2:
                         die(f"Whisper falhou e AssemblyAI fallback também: {exc2}")
@@ -1043,7 +1178,8 @@ def main() -> None:
             # com sucesso. Em cache hit não salvamos (já está lá). Falha
             # de cache é silenciosa — não derruba a transcrição.
             if segments and not args.no_cache:
-                _cache_save(args.url, args.diarize, segments, speakers, engine_used, title)
+                _cache_save(args.url, args.diarize, segments, speakers,
+                            engine_used, title, autolang=autolang)
         else:
             # Cache hit: já temos segments. Só precisamos do título pra render.
             # Sem chamada de rede aqui — usa oEmbed cache local se for YouTube;
@@ -1068,6 +1204,26 @@ def main() -> None:
             txt_header = f"# Transcrito via: {engine_label}\n# Fonte: {args.url}\n\n"
             content = txt_header + render_analysis(segments, speakers=speakers)
             out_path = output_dir / f"{slug}-analysis{suffix_speakers}.txt"
+        elif args.format == "srt":
+            # Legenda SubRip: SEM header/comentário — o arquivo precisa começar
+            # direto no índice "1", senão players/editores recusam o parsing.
+            # Sempre sem speakers (legenda é trilha de texto), então ignora
+            # `suffix_speakers` e o path é só `-srt.srt`.
+            content = render_srt(segments)
+            out_path = output_dir / f"{slug}-srt.srt"
+        elif args.format == "srt_ptbr":
+            # Legenda SubRip traduzida: traduz só o TEXTO de cada frase e
+            # reencaixa nos mesmos timestamps (render_srt(texts=...)) — o
+            # sincronismo é preservado porque o tempo nunca é tocado.
+            from translate import translate_cues
+            originals = srt_sentence_texts(segments)
+            log(f"traduzindo {len(originals)} blocos pra pt-br…")
+            try:
+                translated = translate_cues(originals)
+            except RuntimeError as exc:
+                die(str(exc))
+            content = render_srt(segments, texts=translated)
+            out_path = output_dir / f"{slug}-srt-ptbr.srt"
         else:
             content = render_reading(
                 segments, title, args.url, speakers=speakers,

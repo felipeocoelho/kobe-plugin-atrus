@@ -154,7 +154,7 @@ def transcribe_with_speakers(
 def transcribe_without_speakers(
     audio_path: Path,
     api_key: str,
-    language_code: str = "pt",
+    language_code: Optional[str] = "pt",
 ) -> list[dict]:
     """Transcreve SEM diarização — usado como fallback do Whisper Groq.
 
@@ -164,6 +164,9 @@ def transcribe_without_speakers(
     Diferenças vs `transcribe_with_speakers`:
     - `speaker_labels=False` (mais barato, ~$0.12/h vs ~$0.37/h)
     - Sem `utterances` → usa `words` agrupando em segments de ~3s
+
+    `language_code=None` liga a auto-detecção de idioma da AssemblyAI
+    (usada no fallback do formato traduzido, cujo áudio é estrangeiro).
     """
     try:
         import assemblyai as aai  # type: ignore
@@ -174,13 +177,18 @@ def transcribe_without_speakers(
         ) from exc
 
     aai.settings.api_key = api_key
-    config = aai.TranscriptionConfig(
+    config_kwargs = dict(
         speaker_labels=False,
-        language_code=language_code,
         punctuate=True,
         format_text=True,
         speech_models=["universal-2"],
     )
+    if language_code:
+        config_kwargs["language_code"] = language_code
+    else:
+        # Sem idioma fixo → deixa a AssemblyAI detectar.
+        config_kwargs["language_detection"] = True
+    config = aai.TranscriptionConfig(**config_kwargs)
 
     _log(f"enviando áudio pro AssemblyAI sem speakers ({audio_path.stat().st_size // 1024} KB)…")
     transcriber = aai.Transcriber(config=config)
